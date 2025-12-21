@@ -1,0 +1,323 @@
+--[[
+
+SCRIPT NAME: SERVER-ESM (Server Enemy State Machine)
+TIME-TAKEN FOR CORE-IMPLEMENTATION: 1 to 2 Weeks of planning and pseudocode and around another 2 weeks of implementation and polishing.
+
+OVERVIEW:
+This advanced module was created to solve a serious problem I encountered when replicating hundreds to thousands of enemies 
+in Roblox. As we know, this game suffers from horrible optimization practices and is overall a headache to work with.
+
+Using, server-sided math calculations and movemenet, client-sided predictions, replication and fake movement, I achieved
+something that can only be described as extraordinary. This is a module that handles some of the server sided movement aspects
+and calculations. If I could I would love to go in detail about how each core game mechanic works and how I achieved something
+some describe as genius. With little over 2 years of ACTIVE scripting in Roblox, this feat is something I never thought I
+could pull of by myself. But I did it!
+
+
+]]
+
+
+local RunService = game:GetService("RunService")
+local HTTPService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local Events = ReplicatedStorage.Events
+
+local Shared = ReplicatedStorage.Shared
+local Modules = Shared.Modules
+local ObjectPooling = Modules.ObjectPooling
+local Core = Shared.Core
+local Configs = Core.Configs
+local AbilityConfigs = require(Configs.AbilityConfigs)
+
+local Services = ServerScriptService.Services
+local EnemyBehavior = Services.EnemyBehavior
+local WaveServices = Services.WaveServices
+local LevelingServices = Services.LevelingServices
+local Abilities = Services.Abilities
+
+local ObjectPoolModule = require(ObjectPooling.ObjectPoolModule)
+local ServerESM_Data = require(EnemyBehavior.ServerESM_Data)
+local WaveData = require(WaveServices.WaveData)
+local LevelingManager = require(LevelingServices.LevelingManager)
+local AttackController = require(Abilities.AttackController)
+
+local EnemyManager = {}
+local EnemiesFolder = workspace.Enemies
+EnemyManager.Enemies = {}
+
+local MAX_ENEMY_RENDER_DISTANCE = 150
+local CollisionRadius = 10
+
+
+
+local function onFree(enemy : Vector3Value)
+	local enemyData = ServerESM_Data.Enemies[enemy.Name]
+	if enemyData then
+		ServerESM_Data:RemoveEnemyFromGrid(enemy.Name,enemyData.Position)
+		ServerESM_Data.Enemies[enemy] = nil
+	end
+end
+
+--//OBJECT POOLS
+local EnemyNodePool = ObjectPoolModule.new(Instance.new("Vector3Value"),1000)
+
+
+-- Initialize EnemyManager loop
+function EnemyManager.init()
+	RunService.Heartbeat:Connect(function(dt)
+		EnemyManager:Update(dt)
+	end)
+end
+
+-- Add enemy to manager
+function EnemyManager.AppendEnemy(enemy: Model, config)
+
+	config.LastState = nil
+	config.Health = config.MaxHealth
+
+
+
+	--Node Based Vector3 representation of the enemy
+	local EnemyNode = EnemyNodePool:get()
+	EnemyNode:SetAttribute("EnemyType", enemy.Name)
+	EnemyNode.Name = HTTPService:GenerateGUID(false)
+	EnemyNode.Value = config.Position
+
+
+	Events.SendEnemyToClient:FireAllClients(EnemyNode.Name, enemy.Name,config)
+
+	config.attackController = AttackController.new(EnemyNode)
+	config.Owner = EnemyNode
+	-- Set attributes for client/projectile use
+	EnemyNode:SetAttribute("KnockbackResistance", config.KnockbackResistance)
+	EnemyNode:SetAttribute("Weapon", config.Weapon)
+	EnemyNode:SetAttribute("MaxHealth", config.MaxHealth)
+	EnemyNode:SetAttribute("Health", config.MaxHealth)
+	EnemyNode:SetAttribute("Combat", config.Combat)
+	EnemyNode:SetAttribute("Style", config.Style)
+	EnemyNode:SetAttribute("State", "Idle")
+
+	EnemyNode.Parent = workspace.Enemies
+	-- Add enemy to pool
+	EnemyManager.Enemies[EnemyNode] = config
+	ServerESM_Data.Enemies[EnemyNode] = config
+	EnemyManager.HandleDamage(EnemyNode)
+end
+
+-- Prepare enemy collision
+function EnemyManager.PrepareEnemy(enemy: Model)
+	for _, part in pairs(enemy:GetChildren()) do
+		if part:IsA("BasePart") then
+			part.CollisionGroup = "Enemies"
+		end
+	end
+end
+
+-- Find nearest player
+function EnemyManager:FindNearestPlayer(state, node : Vector3Value)
+	local closestRoot = nil
+	local closestDistance = math.huge
+
+	for _, player in pairs(Players:GetPlayers()) do
+		local char = player.Character
+		if not char then continue end
+
+		local root = char:FindFirstChild("HumanoidRootPart")
+		if not root then continue end
+
+		local distance = (root.Position - state.Position).Magnitude
+		if distance < closestDistance then
+			closestDistance = distance
+			closestRoot = root
+		end
+	end
+	if closestRoot and state.TargetRoot ~= closestRoot then
+		print("Found a Target:",closestRoot.Parent.Name)
+		node:SetAttribute("Target", closestRoot.Parent.Name)
+	end
+	return closestRoot
+end
+
+-- Check if enemy is in attack range
+function EnemyManager:InAttackRange(state, targetRoot, attackRange)
+	local dist = (targetRoot.Position - state.Position).Magnitude
+	return dist <= attackRange
+end
+
+-- Handle enemy damage (math-based)
+function EnemyManager.HandleDamage(enemy: Vector3Value)
+	local conn = nil
+	conn = enemy:GetAttributeChangedSignal("Health"):Connect(function()
+		local state = EnemyManager.Enemies[enemy]
+		if not state then return end
+
+		-- Always update state.Health for math-based hits
+		state.Health = enemy:GetAttribute("Health")
+
+		-- Enemy dies if health <= 0
+		if state.Health <= 0 then
+			conn:Disconnect()
+			conn = nil
+			EnemyManager:Die(state, enemy)
+		end
+	end)
+end
+
+-- Enemy death
+function EnemyManager:Die(state, enemy)
+	print(enemy.Name,"is set to die!")
+	local PlayerToReward = game.Players:GetPlayerByUserId(enemy:GetAttribute("Killer"))
+	LevelingManager.GrantEXP(PlayerToReward,state.Exp)
+	-- Clear state table
+	for k in pairs(state) do
+		state[k] = nil
+	end
+	ServerESM_Data.Enemies[enemy] = nil
+
+	EnemyNodePool:free(enemy)
+end
+
+-- Attack logic (works with projectiles)
+function EnemyManager:Attack(enemy, target)
+	local state = ServerESM_Data.Enemies[enemy]
+	if not state then return end
+	if state.OnCooldown then return end
+	local attacked, _, cooldown = state.attackController:Use(
+		state.Combat,
+		state.Style,
+		state.Weapon,
+		target,
+		AbilityConfigs[state.Weapon]
+	)
+
+	if not attacked then
+		state.OnCooldown = true
+		task.delay(cooldown, function()
+			if state then state.OnCooldown = false end
+		end)
+	end
+end
+
+--Basic  2D (XZ) Collision For Enemy Movement
+--This function mimics low level 2D collision using a circle as it's basic shape (radius)
+function EnemyManager:ResolveCollisions(enemyNode, state)
+	local pos = state.Position
+	local radius = state.Radius/4
+
+	--When a enemy is spawned it's assigned a cell based on it's position.
+	--We use it's updated position to get which cell it currently is in.
+	local ChunkKey = ServerESM_Data:GetCellKeyFromPos(pos) 
+	local Chunk = ServerESM_Data.Grid[ChunkKey]
+	if not Chunk then return end
+
+	--Using this cell we compare each enemy in the cell to the current enemy to determine if they are overlapping
+	--I usually don't share my methods as I hold them dear, but for this submission I will have to \_/(- _ -)\_/
+	for enemyKey, _ in pairs(Chunk) do
+		local otherNode = EnemiesFolder:FindFirstChild(enemyKey)
+		local otherstate = ServerESM_Data.Enemies[otherNode]
+		if otherNode == enemyNode then continue end
+		if not otherstate then continue end
+
+		local diff = pos - otherstate.Position
+		local distSq = diff.X*diff.X + diff.Z*diff.Z
+		local minDist = radius + otherstate.Radius/4
+
+		if distSq < minDist*minDist then
+			local dist = math.sqrt(distSq)
+			local overlap = minDist - dist
+			if dist > 0 then
+				-- Normalize diff
+				local pushDir = Vector3.new(diff.X/dist, 0, diff.Z/dist)
+				-- Push both enemies apart evenly
+				local halfPush = pushDir * (overlap * 0.5)
+				pos += halfPush
+				otherstate.Position -= halfPush
+				state.Position += halfPush
+			else
+				-- Perfect overlap (same position): push randomly
+				pos += Vector3.new(math.random(), 0, math.random()).Unit * 0.1
+			end
+		end
+	end
+end
+
+local last = 0
+local now = 0
+local count = 0
+local refreshTarg = {}
+
+local Targets = {}
+
+-- Main update loop
+function EnemyManager:Update(dt)
+	if WaveData.IsPaused then warn(WaveData.IsPaused) return end
+	--With each enemy being stored in a dictionary as a Vector3Value holding their state, the usage of parts has been eliminated.
+	--I could completely eliminate the usage of instances however, I'm keeping this system for now.
+	for EnemyNode: Vector3Value, state in pairs(ServerESM_Data.Enemies) do
+		now = os.clock()
+		-- 1. Refresh target (Find Nearest Player)
+		if not refreshTarg[EnemyNode] and not Targets[EnemyNode] then
+			state.TargetRoot = self:FindNearestPlayer(state, EnemyNode)
+			Targets[EnemyNode] = state.TargetRoot
+			refreshTarg[EnemyNode] = true
+		end
+		if not state.TargetRoot then continue end
+
+		--Basic Cooldown logic for finding a new nearest player
+		if now - last > .5 then
+			refreshTarg[EnemyNode] = false
+			last = now
+		end
+
+		-- 2. Math-based movement toward target
+		local dir = state.TargetRoot.Position - state.Position
+		dir = Vector3.new(dir.X, 0, dir.Z) -- ignore Y for walking (every enemy is spawned with their feet touching the floor)
+		
+		--If the distance between the player and the enemy is greater than the enemy's preferredDistance then the enemy moves
+		local moveStep = dir.Unit * state.Speed * dt
+		if dir.Magnitude > (state.PreferredDistance or 3) then
+			state.State = "Chase"
+
+			--Move the enemy
+			state.Position += moveStep
+			--Update it's position, potentially changing it's cell
+			ServerESM_Data:UpdateEnemyPosition(EnemyNode.Name, state.Position)
+			--Checks if the enemy is colliding with another enemy and resolves the collision
+			self:ResolveCollisions(EnemyNode,state)
+			--Update the position once more just in case the enemy is pushed to a new cell
+			ServerESM_Data:UpdateEnemyPosition(EnemyNode.Name, state.Position)
+			--Gets the cell key based on it's position
+			local CellKey = ServerESM_Data:GetCellKeyFromPos(state.TargetRoot.Position)
+			--Gets the cell the enemy is in
+			local Cell = ServerESM_Data.Grid[CellKey]
+			--This check is here to make sure that a maximum of 50 enemies are updated from each cell.
+			--There is a solution to improve this check but I have not bothered to implement it as yet.
+			if Cell and count < 50 then
+				local InCell = Cell[EnemyNode.Name]
+				if InCell then
+					count += 1
+					EnemyNode.Value = state.Position
+				end
+			end
+			if count >= 50 then
+				task.delay(1, function()
+					count = 0
+				end)
+			end
+		end
+
+
+		-- 3. Attack if in range
+		if self:InAttackRange(state, state.TargetRoot, state.PreferredDistance) and not state.OnCooldown then
+			print("In attack distance")
+			state.State = "Other"
+			self:Attack(EnemyNode, state.TargetRoot.Parent)
+		end
+		state.LastState = state.State
+	end
+end
+
+return EnemyManager
