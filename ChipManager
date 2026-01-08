@@ -1,0 +1,486 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HTTPService = game:GetService("HttpService")
+
+local Events = ReplicatedStorage.Events
+
+local ItemPrefabs = ReplicatedStorage.ItemPrefabs
+
+local ChipManager = {}
+ChipManager.__index = ChipManager
+
+function ChipManager.new(RedPlayer : Player, BluePlayer : Player, TableModel : Model)
+	local self = setmetatable({}, ChipManager)
+	self.TableModel = TableModel
+	self.RedPlayer = RedPlayer
+	self.BluePlayer = BluePlayer
+
+	self.RedName = RedPlayer.Name
+	self.BlueName = BluePlayer.Name
+	
+	self.RedExplosionVFX = RedPlayer:GetAttribute("ExplosionVFX") or "Explosion"
+	self.BlueExplosionVFX = BluePlayer:GetAttribute("ExplosionVFX") or "StarExplosion"
+	self.GameStarted = false
+	self.MaxChoices = 1
+
+	self.RedHeartsUsed = 0
+	self.BlueHeartsUsed = 0
+
+	self.RedIndex = 0
+	self.BlueIndex = 0
+
+	self.Columns = 6
+
+	self.RedAmountToEat = 0
+	self.BlueAmountToEat = 0
+
+	self.RedCanClick = false
+	self.BlueCanClick = false
+	self.InSabotagePhase = false
+	self.RoundStarted = false
+	
+
+	self.MAX_ROUND_TIME = 300
+	self.MAX_CHOICE_TIME = 30
+
+	self.TURN_TRANSITION_DELAY = 1
+	self.Last = 0
+
+	self.Timer = 0
+	self.Ended = false
+	self.RefreshChipsNextRound = true
+	--//Bomb Variables//--
+	self.RefreshBombs = false
+	self.AllowSelfDestruct = true
+	self.HasToEatBomb = true
+	
+	self.BluePrefabName = BluePlayer:GetAttribute("ChipName") or "Cookie"
+	self.RedPrefabName = RedPlayer:GetAttribute("ChipName") or "Chip"
+	self.Cameras = TableModel.Cameras
+
+	self.ChipInstances = {} -- Store chip instances
+
+	return self
+end
+
+function ChipManager:createChip(itemName)
+	local Item = ItemPrefabs:FindFirstChild(itemName)
+	if not Item then 
+		Item = ItemPrefabs:FindFirstChild("Chip")
+		warn(itemName,"was not found in ItemPrefabs... Defaulting to Chip") 
+	end
+	Item = Item:Clone()
+	return Item
+end
+
+function ChipManager:rollDice()
+	return math.floor(math.random() * 6) + 1
+end
+
+function ChipManager:loadChips(tweenActive)
+	if tweenActive then
+		Events.TweenCamera:FireClient(self.RedPlayer, self.Cameras.MainCam.CFrame)
+		Events.TweenCamera:FireClient(self.BluePlayer, self.Cameras.MainCam.CFrame)
+	end
+
+	local Parts = self.TableModel:FindFirstChild("Parts"):GetChildren()
+
+	local function LoadChip(Owner : Player, Target : Player, ChipName : string, part : BasePart, Parent)
+		local Item = self:createChip(ChipName)
+		Item.Name = HTTPService:GenerateGUID(false)
+		task.delay(2, function()
+			Item.CFrame = part.CFrame + Vector3.new(0,Item.Size.Y/2,0)
+		end)
+		Item.Anchored = true
+		part:SetAttribute("Occupied", true)
+		local ClickDetector = Instance.new("ClickDetector")
+		ClickDetector.MouseClick:Connect(function(playerWhoClicked)
+			if playerWhoClicked ~= Owner and playerWhoClicked ~= Target then return end
+			if self.Ended then return end
+			
+			local Char = playerWhoClicked.Character
+			if not Char then
+				self.Ended = true
+				return
+			end
+			local Humanoid = Char:FindFirstChild("Humanoid")
+			if not Humanoid or Humanoid and Humanoid.Health <= 0 then
+				self.Ended = true
+				return
+			end
+
+			local HealthDecrement = 1/3
+			
+			local function HandleChoice(Index)
+				Index += 1
+				HealthDecrement = Index * HealthDecrement
+				if Index >= self.MaxChoices then
+					Humanoid.Health = 0
+				end
+				part:SetAttribute("Link", nil)
+				return Index
+			end
+			
+			local IsRed = self.RedPlayer == playerWhoClicked
+
+			-- SABOTAGE PHASE: Choose bombs
+			if self.InSabotagePhase then
+
+				local ChoicesMade = IsRed and self.RedIndex or self.BlueIndex
+
+				if ChoicesMade >= self.MaxChoices then return end
+				
+				
+				local IsBomb = Item:GetAttribute("Bomb")
+				
+				if not self.AllowSelfDestruct then
+					if IsBomb and Owner ~= playerWhoClicked.UserId then
+						self.Damaged = true
+						print("Chose a bomb!")
+						Events.PlayAudioInObject:FireAllClients("Eat", playerWhoClicked.Character.PrimaryPart)
+						if IsRed then
+							Events.NotifyClientAte:FireAllClients(self.RedPlayer,"Bomb")
+							Events.SpawnVFXInPart:FireAllClients(self.BlueExplosionVFX,Char.HumanoidRootPart)
+							
+							Events.UpdateGameState:FireClient(self.RedPlayer, self.RedName.." chose a Bomb While Attempting to Set One1")
+							Events.UpdateGameState:FireClient(self.BluePlayer, self.RedName.." chose a Bomb While Attempting to Set One!")
+							self.RedHeartsUsed = HandleChoice(self.RedHeartsUsed)
+							Events.UpdatePlayerHeart:FireAllClients(self.TableModel,"Red", self.RedHeartsUsed, true)
+						else
+							Events.NotifyClientAte:FireAllClients(self.BluePlayer,"Bomb")
+							Events.SpawnVFXInPart:FireAllClients(self.RedExplosionVFX,Char.HumanoidRootPart)
+							Events.UpdateGameState:FireClient(self.RedPlayer, self.BlueName.." chose a Bomb While Attempting to Set One!")
+							Events.UpdateGameState:FireClient(self.BluePlayer, self.BlueName.." chose a Bomb While Attempting to Set One!")
+							self.BlueHeartsUsed = HandleChoice(self.BlueHeartsUsed)
+							Events.UpdatePlayerHeart:FireAllClients(self.TableModel,"Blue", self.BlueHeartsUsed, true)
+						end
+
+						Item:Destroy()
+						Humanoid.Health = Humanoid.MaxHealth - (Humanoid.MaxHealth * HealthDecrement)
+						return
+					end 
+				end
+				
+				if IsBomb and playerWhoClicked.UserId == Item:GetAttribute("Owner") then return end
+				Events.HighlightSelectedChip:FireClient(playerWhoClicked, Item)
+
+				if IsRed then
+					self.RedIndex += 1
+				else
+					self.BlueIndex += 1
+				end
+				
+
+				part:SetAttribute("Link", Item.Name)
+				Item:SetAttribute("Linked", true)
+				Item:SetAttribute("Bomb", true)
+				Item:SetAttribute("Owner", playerWhoClicked.UserId)
+				
+				Events.PlayAudioInObject:FireClient(playerWhoClicked,"Evil Laugh", playerWhoClicked.Character.PrimaryPart)
+
+				if self.BlueIndex >= self.MaxChoices and self.RedIndex >= self.MaxChoices then
+					self:startEatingPhase()
+				end
+				return
+			end
+
+			-- EATING PHASE: Click to eat chips
+			if not self.RoundStarted then return end
+
+			if IsRed and not self.RedCanClick then return end
+			if not IsRed and not self.BlueCanClick then return end
+
+			-- Can't click your own bomb
+			if not self.AllowSelfDestruct then
+				if Item:GetAttribute("Owner") == playerWhoClicked.UserId and Item:GetAttribute("Bomb") then
+					return
+				end
+			end
+
+			local AmountToEat = IsRed and self.RedAmountToEat or self.BlueAmountToEat
+			if AmountToEat <= 0 then return end
+
+			-- Prevent rapid clicking
+			if os.clock() - self.Last < 0.25 then return end
+			self.Last = os.clock()
+
+			part:SetAttribute("Occupied", nil)
+			
+			-- Decrement amount to eat
+			if IsRed then
+				self.RedAmountToEat -= 1
+			else
+				self.BlueAmountToEat -= 1
+			end
+
+			Events.PlayAudioInObject:FireAllClients("Eat", playerWhoClicked.Character.PrimaryPart)
+			task.wait(.1)
+
+			-- Check if this was a bomb
+			if not Item:GetAttribute("Bomb") then
+				print("Safe!")
+				if self.Ended then return end
+				if IsRed then
+					Events.UpdateGameState:FireClient(self.RedPlayer, self.RedName.." is Safe!")
+					Events.UpdateGameState:FireClient(self.BluePlayer, self.RedName.." is Safe!")
+				else
+					Events.UpdateGameState:FireClient(self.RedPlayer, self.BlueName.." is Safe!")
+					Events.UpdateGameState:FireClient(self.BluePlayer, self.BlueName.." is Safe!")
+				end
+
+				Item:Destroy()
+
+				-- Check if player finished eating their amount
+				self:checkTurnSwitch(IsRed)
+				return
+			end
+
+			-- BOMB HIT!
+			
+
+			if IsRed then
+				Events.NotifyClientAte:FireAllClients(self.RedPlayer,"Bomb")
+				Events.SpawnVFXInPart:FireAllClients(self.RedExplosionVFX,Char.HumanoidRootPart)
+				self.RedHeartsUsed = HandleChoice(self.RedHeartsUsed)
+				Events.UpdatePlayerHeart:FireAllClients(self.TableModel,"Red", self.RedHeartsUsed, true)
+				Events.UpdateGameState:FireClient(self.RedPlayer, self.RedName.." chose A Bomb!")
+				Events.UpdateGameState:FireClient(self.BluePlayer, self.RedName.." chose A Bomb!")
+			else
+				Events.NotifyClientAte:FireAllClients(self.BluePlayer,"Bomb")
+				Events.SpawnVFXInPart:FireAllClients(self.BlueExplosionVFX,Char.HumanoidRootPart)
+				self.BlueHeartsUsed = HandleChoice(self.BlueHeartsUsed)
+				Events.UpdatePlayerHeart:FireAllClients(self.TableModel,"Blue", self.BlueHeartsUsed, true)
+				Events.UpdateGameState:FireClient(self.RedPlayer, self.BlueName.." chose A Bomb!")
+				Events.UpdateGameState:FireClient(self.BluePlayer, self.BlueName.." chose A Bomb!")
+			end
+
+			Humanoid.Health = Humanoid.MaxHealth - (Humanoid.MaxHealth * HealthDecrement)
+
+			Item:Destroy()
+			self.Damaged = true
+			-- Check if player finished eating (they hit a bomb so their turn ends)
+			self:checkTurnSwitch(IsRed)
+		end)
+		ClickDetector.Parent = Item
+
+		Item.Parent = Parent
+
+		-- Store reference
+		table.insert(self.ChipInstances, Item)
+
+		--Let the clients simulate the chip falling
+		Events.SimulateChip:FireClient(self.RedPlayer,self.TableModel, Item.Name, part, "Fall")
+		Events.SimulateChip:FireClient(self.BluePlayer,self.TableModel, Item.Name, part, "Fall")
+		return Item
+	end
+
+	table.sort(Parts,function(a,b)
+		return tonumber(a.Name) > tonumber(b.Name)
+	end)
+
+	for i=1, #Parts do
+		local part = Parts[i]
+		if part:GetAttribute("Occupied") then continue end
+		local row = math.floor((i-1) / self.Columns)  
+		local col = (i-1) % self.Columns
+
+		local isBlue = (row + col) % 2 == 0
+
+		if isBlue then
+			LoadChip(self.RedPlayer, self.BluePlayer, self.BluePrefabName, part, self.TableModel.Chips)
+		else
+			LoadChip(self.RedPlayer, self.BluePlayer, self.RedPrefabName, part, self.TableModel.Chips)
+		end
+		task.wait(.125)
+	end
+
+end
+
+function ChipManager:startSabotagePhase()
+	if self.Ended then return end
+
+	self.InSabotagePhase = true
+	self.RoundStarted = false
+	self.RedIndex = 0
+	self.BlueIndex = 0
+	
+
+
+	-- Clear previous bomb markers
+	for _, part in self.TableModel.Parts:GetChildren() do
+		local Link = part:GetAttribute("Link")
+		if not Link then continue end
+		local Item = self.TableModel.Chips:FindFirstChild(Link)
+		if self.RefreshBombs then
+			part:SetAttribute("Link", nil)
+			Item:SetAttribute("Bomb", nil)
+			local Owner = Item:GetAttribute("Owner")
+			local IsRed = Owner == self.RedPlayer.UserId
+			Item:SetAttribute("Owner",nil)
+			if IsRed then
+				Events.HighlightSelectedChip:FireClient(self.RedPlayer, Item, true)
+			else
+
+				Events.HighlightSelectedChip:FireClient(self.BluePlayer, Item, true)
+			end
+		else
+			if not Item:GetAttribute("Bomb") then
+				part:SetAttribute("Link", nil)
+			end
+		end
+		
+	end
+
+	if self.RefreshChipsNextRound and self.Damaged  then
+		self:loadChips()
+		self.Damaged = false
+	end
+
+	Events.TweenCamera:FireClient(self.RedPlayer, self.Cameras.ChoiceCam.CFrame)
+	Events.TweenCamera:FireClient(self.BluePlayer, self.Cameras.ChoiceCam.CFrame)
+	
+	Events.UpdateGameGui:FireAllClients(self.TableModel,"")
+
+	Events.UpdateGameState:FireClient(self.RedPlayer, "Choose your bomb!")
+	Events.UpdateGameState:FireClient(self.BluePlayer, "Choose your bomb!")
+
+	-- Timer countdown
+	self.Timer = self.MAX_CHOICE_TIME
+	for i = self.Timer, 1, -1 do
+		if self.Ended then break end
+		if not self.InSabotagePhase then break end
+
+		local Msg = "Choose which item to sabotage in "..i.." seconds!"
+		Events.UpdateInfoLabel:FireClient(self.RedPlayer, Msg)
+		Events.UpdateInfoLabel:FireClient(self.BluePlayer, Msg)
+		task.wait(1)
+	end
+
+	Events.UpdateInfoLabel:FireClient(self.RedPlayer, "")
+	Events.UpdateInfoLabel:FireClient(self.BluePlayer, "")
+	
+	if self.Ended then return end
+	Events.TweenCamera:FireClient(self.RedPlayer, self.Cameras.MainCam.CFrame)
+	Events.TweenCamera:FireClient(self.BluePlayer, self.Cameras.MainCam.CFrame)
+	
+	
+	-- If time runs out, start anyway
+	if self.InSabotagePhase  then
+		self:startEatingPhase()
+	end
+end
+
+function ChipManager:startEatingPhase()
+	if self.Ended then return end
+	if self.RoundStarted then return end
+
+	self.InSabotagePhase = false
+	self.RoundStarted = true
+
+	Events.UpdateGameState:FireClient(self.RedPlayer, "Get Ready...")
+	Events.UpdateGameState:FireClient(self.BluePlayer, "Get Ready...")
+
+	task.wait(.5)
+
+	-- Red goes first
+	self.RedCanClick = true
+	self.BlueCanClick = false
+
+	task.delay(3.5, function()
+		self.RedAmountToEat = self:rollDice()
+
+		Events.NotifyDiceRoll:FireClient(self.RedPlayer,self.RedAmountToEat)
+		task.wait(2.5)
+		Events.UpdateGameState:FireClient(self.RedPlayer, self.RedName.." must eat "..self.RedAmountToEat.." chips!")
+		Events.UpdateGameState:FireClient(self.BluePlayer, self.RedName.." must eat "..self.RedAmountToEat.." chips!")
+		
+		Events.TweenCamera:FireClient(self.RedPlayer, self.Cameras.RedCam.CFrame)
+		Events.TweenCamera:FireClient(self.BluePlayer, self.Cameras.RedCam.CFrame)
+
+		task.wait(2)
+
+		Events.TweenCamera:FireClient(self.RedPlayer, self.Cameras.ChoiceCam.CFrame)
+		Events.TweenCamera:FireClient(self.BluePlayer, self.Cameras.MainCam.CFrame)
+	end)
+
+	if not self.GameStarted then
+		Events.StartRound:Fire(self.TableModel)
+		self.GameStarted = true
+	end
+end
+
+function ChipManager:checkTurnSwitch(IsRed)
+	if self.Ended then return end
+
+	local currentAmountToEat = IsRed and self.RedAmountToEat or self.BlueAmountToEat
+
+	-- If player still has chips to eat, don't switch
+	if currentAmountToEat > 0 then return end
+
+	-- Player finished their turn
+	if IsRed then
+		-- Red finished, switch to Blue
+		self.RedCanClick = false
+
+		task.wait(self.TURN_TRANSITION_DELAY)
+
+		if self.Ended then return end
+
+		self.BlueCanClick = true
+		self.BlueAmountToEat = self:rollDice()
+		
+		Events.NotifyDiceRoll:FireClient(self.BluePlayer,self.BlueAmountToEat)
+		task.wait(2.5)
+
+		Events.UpdateGameState:FireClient(self.RedPlayer, self.BlueName.." must eat "..self.BlueAmountToEat.." chips!")
+		Events.UpdateGameState:FireClient(self.BluePlayer, self.BlueName.." must eat "..self.BlueAmountToEat.." chips!")
+
+		Events.TweenCamera:FireClient(self.RedPlayer, self.Cameras.BlueCam.CFrame)
+		Events.TweenCamera:FireClient(self.BluePlayer, self.Cameras.BlueCam.CFrame)
+		
+		task.wait(1)
+		
+		Events.TweenCamera:FireClient(self.RedPlayer, self.Cameras.MainCam.CFrame)
+		Events.TweenCamera:FireClient(self.BluePlayer, self.Cameras.ChoiceCam.CFrame)
+	else
+		-- Blue finished, both players done eating
+		self.BlueCanClick = false
+
+		task.wait(self.TURN_TRANSITION_DELAY)
+
+		if self.Ended then return end
+
+		-- Start new sabotage phase
+		Events.UpdateGameState:FireClient(self.RedPlayer, "Round complete! Choose new bombs...")
+		Events.UpdateGameState:FireClient(self.BluePlayer, "Round complete! Choose new bombs...")
+
+		task.wait(.5)
+		Events.TweenCamera:FireClient(self.RedPlayer, self.Cameras.ChoiceCam.CFrame)
+		Events.TweenCamera:FireClient(self.BluePlayer, self.Cameras.ChoiceCam.CFrame)
+		self:startSabotagePhase()
+	end
+end
+
+function ChipManager:endRound()
+	self.Ended = true
+
+	Events.UpdatePlayerHeart:FireAllClients(self.TableModel,"Red", self.RedHeartsUsed, false)
+	Events.UpdatePlayerHeart:FireAllClients(self.TableModel,"Blue", self.BlueHeartsUsed, false)
+	Events.UpdateGameGui:FireAllClients(self.TableModel,"0 / 2 Players")
+
+	Events.TweenCamera:FireClient(self.RedPlayer)
+	Events.TweenCamera:FireClient(self.BluePlayer)
+
+	self:removeChips()
+
+	for _, part in self.TableModel.Parts:GetChildren() do
+		part:SetAttribute("Occupied", false)
+		part:SetAttribute("Link", nil)
+	end
+end
+
+function ChipManager:removeChips()
+	self.TableModel.Chips:ClearAllChildren()
+	self.ChipInstances = {}
+end
+
+return ChipManager
